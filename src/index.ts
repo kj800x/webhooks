@@ -31,6 +31,7 @@ class EventsTracker {
 
   // Remove any events older than `retentionPeriodInMs` from the start of the linked list
   // Using the fact that the list is ordered by timestamp
+  // FIXME: There is a bug!
   private purgeOldEvents() {
     const oldestAllowed = Date.now() - this.retentionPeriodInMs;
     while (this.events !== null && this.events.car.timestamp < oldestAllowed) {
