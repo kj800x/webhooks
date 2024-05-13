@@ -4,6 +4,8 @@ import bodyParser from 'body-parser';
 import { createServer } from 'http';
 import { WebSocketServer } from 'ws';
 
+interface D
+
 // MARK: - Types
 
 interface WebhookEvent {
