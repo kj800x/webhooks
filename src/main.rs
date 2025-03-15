@@ -1,16 +1,78 @@
 use actix::{Actor, ActorContext, Addr, AsyncContext, Handler, Message, StreamHandler};
 use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web_actors::ws;
+use actix_web_prom::PrometheusMetricsBuilder;
 use dotenv::dotenv;
 use hex;
 use hmac::{Hmac, Mac};
+use lazy_static::lazy_static;
+use prometheus::{
+    opts, register_counter_vec_with_registry, register_counter_with_registry,
+    register_gauge_with_registry, register_int_gauge_with_registry, Counter, CounterVec, Gauge,
+    IntGauge, Registry,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::Sha256;
 use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+// Define global metrics registry
+lazy_static! {
+    static ref REGISTRY: Registry = Registry::new();
+    static ref SERVER_START_TIME: SystemTime = SystemTime::now();
+    static ref UPTIME_SECONDS: Gauge = register_gauge_with_registry!(
+        opts!(
+            "webhook_server_uptime_seconds",
+            "Time since the server was started in seconds"
+        ),
+        &REGISTRY
+    )
+    .unwrap();
+    static ref EVENTS_RECEIVED_TOTAL: Counter = register_counter_with_registry!(
+        opts!(
+            "webhook_server_events_received_total",
+            "Total number of webhook events received"
+        ),
+        &REGISTRY
+    )
+    .unwrap();
+    static ref GITHUB_EVENTS_RECEIVED_TOTAL: CounterVec = register_counter_vec_with_registry!(
+        opts!(
+            "webhook_server_github_events_received_total",
+            "GitHub webhook events received"
+        ),
+        &["event_type"],
+        &REGISTRY
+    )
+    .unwrap();
+    static ref WEBSOCKET_CLIENTS_CONNECTED: IntGauge = register_int_gauge_with_registry!(
+        opts!(
+            "webhook_server_websocket_clients_connected",
+            "Number of WebSocket clients currently connected"
+        ),
+        &REGISTRY
+    )
+    .unwrap();
+    static ref EVENTS_CACHE_SIZE: IntGauge = register_int_gauge_with_registry!(
+        opts!(
+            "webhook_server_events_cache_size",
+            "Number of events currently stored in cache"
+        ),
+        &REGISTRY
+    )
+    .unwrap();
+}
+
+// Update metrics function
+fn update_metrics() {
+    // Update uptime
+    if let Ok(duration) = SystemTime::now().duration_since(*SERVER_START_TIME) {
+        UPTIME_SECONDS.set(duration.as_secs_f64());
+    }
+}
 
 // WebSocket messages
 #[derive(Message)]
@@ -32,11 +94,18 @@ impl Actor for WebSocketSession {
             id: self.id,
             addr: ctx.address().recipient(),
         });
+
+        // Increment connected clients metric
+        WEBSOCKET_CLIENTS_CONNECTED.inc();
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> actix::Running {
         // Unregister from WebSocketServer
         self.server_addr.do_send(Disconnect { id: self.id });
+
+        // Decrement connected clients metric
+        WEBSOCKET_CLIENTS_CONNECTED.dec();
+
         actix::Running::Stop
     }
 }
@@ -109,6 +178,9 @@ impl Handler<Connect> for WebSocketServer {
     fn handle(&mut self, msg: Connect, _: &mut Self::Context) {
         println!("WebSocket client connected: {}", msg.id);
         self.sessions.insert(msg.id, msg.addr);
+
+        // Update metrics on connection count
+        WEBSOCKET_CLIENTS_CONNECTED.set(self.sessions.len() as i64);
     }
 }
 
@@ -118,6 +190,9 @@ impl Handler<Disconnect> for WebSocketServer {
     fn handle(&mut self, msg: Disconnect, _: &mut Self::Context) {
         println!("WebSocket client disconnected: {}", msg.id);
         self.sessions.remove(&msg.id);
+
+        // Update metrics on connection count
+        WEBSOCKET_CLIENTS_CONNECTED.set(self.sessions.len() as i64);
     }
 }
 
@@ -125,16 +200,9 @@ impl Handler<BroadcastMessage> for WebSocketServer {
     type Result = ();
 
     fn handle(&mut self, msg: BroadcastMessage, _: &mut Self::Context) {
-        let message_text = msg.0.clone();
-        println!(
-            "Broadcasting message to {} clients: {}",
-            self.sessions.len(),
-            message_text
-        );
-
         // Send to all connected WebSocket sessions
         for (_, addr) in &self.sessions {
-            addr.do_send(BroadcastMessage(message_text.clone()));
+            addr.do_send(BroadcastMessage(msg.0.clone()));
         }
     }
 }
@@ -181,6 +249,9 @@ impl EventsCache {
         if self.events.len() > self.max_size {
             self.events.pop_front();
         }
+
+        // Update metrics for cache size
+        EVENTS_CACHE_SIZE.set(self.events.len() as i64);
     }
 
     fn get_events(&self) -> Vec<TimestampedEvent> {
@@ -352,14 +423,16 @@ async fn github_webhook_handler(
         }
     };
 
-    // Log the webhook request
-    println!(
-        "Received GitHub webhook ({}): {}",
-        github_event
-            .clone()
-            .unwrap_or_else(|| "unknown".to_string()),
-        serde_json::to_string_pretty(&payload).unwrap()
-    );
+    let event_type = github_event
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
+    EVENTS_RECEIVED_TOTAL.inc();
+    GITHUB_EVENTS_RECEIVED_TOTAL
+        .with_label_values(&[&event_type])
+        .inc();
+
+    // Log the webhook request (concise version)
+    println!("Received GitHub webhook event: {}", event_type);
 
     // Add to events cache
     {
@@ -387,11 +460,18 @@ async fn webhook_handler(
     srv: web::Data<Addr<WebSocketServer>>,
     events_cache: web::Data<Arc<Mutex<EventsCache>>>,
 ) -> impl Responder {
-    // Log the webhook request to stdout
-    println!(
-        "Received webhook: {}",
-        serde_json::to_string_pretty(&payload).unwrap()
-    );
+    // Increment webhook counter
+    EVENTS_RECEIVED_TOTAL.inc();
+
+    // Extract the action or type from the payload if available
+    let event_type = payload
+        .get("action")
+        .or_else(|| payload.get("type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    // Log the webhook request (concise version)
+    println!("Received webhook event: {}", event_type);
 
     // Extract payload once
     let payload_value = payload.into_inner();
@@ -410,7 +490,19 @@ async fn webhook_handler(
 }
 
 async fn health_check() -> impl Responder {
+    // Update uptime metric
+    update_metrics();
+
     HttpResponse::Ok().body("Server is running\n")
+}
+
+// Background task to update metrics
+async fn metrics_updater() {
+    let mut interval = actix_web::rt::time::interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        update_metrics();
+    }
 }
 
 #[actix_web::main]
@@ -452,11 +544,28 @@ async fn main() -> std::io::Result<()> {
     // Create events cache
     let events_cache = Arc::new(Mutex::new(EventsCache::new(max_events)));
 
+    // Initialize cache size metric
+    EVENTS_CACHE_SIZE.set(0);
+
+    // Initialize websocket clients metric
+    WEBSOCKET_CLIENTS_CONNECTED.set(0);
+
+    // Setup prometheus metrics with our custom registry
+    let prometheus = PrometheusMetricsBuilder::new("webhook_server")
+        .registry(REGISTRY.clone())
+        .endpoint("/metrics")
+        .build()
+        .unwrap();
+
+    // Start background metrics updater
+    actix_web::rt::spawn(metrics_updater());
+
     // Start WebSocket server actor
     let server = WebSocketServer::default().start();
 
     HttpServer::new(move || {
         App::new()
+            .wrap(prometheus.clone())
             .app_data(web::Data::new(server.clone()))
             .app_data(web::Data::new(events_cache.clone()))
             .route("/webhook", web::post().to(webhook_handler))
