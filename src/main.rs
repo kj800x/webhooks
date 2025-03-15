@@ -94,17 +94,11 @@ impl Actor for WebSocketSession {
             id: self.id,
             addr: ctx.address().recipient(),
         });
-
-        // Increment connected clients metric
-        WEBSOCKET_CLIENTS_CONNECTED.inc();
     }
 
     fn stopping(&mut self, _: &mut Self::Context) -> actix::Running {
         // Unregister from WebSocketServer
         self.server_addr.do_send(Disconnect { id: self.id });
-
-        // Decrement connected clients metric
-        WEBSOCKET_CLIENTS_CONNECTED.dec();
 
         actix::Running::Stop
     }
