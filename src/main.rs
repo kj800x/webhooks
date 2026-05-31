@@ -3,7 +3,6 @@ use actix_web::{web, App, Error, HttpRequest, HttpResponse, HttpServer, Responde
 use actix_web_actors::ws;
 use actix_web_prom::PrometheusMetricsBuilder;
 use dotenv::dotenv;
-use hex;
 use hmac::{Hmac, Mac};
 use lazy_static::lazy_static;
 use prometheus::{
@@ -148,19 +147,12 @@ struct Disconnect {
 }
 
 // WebSocketServer actor to manage connections and broadcast messages
+#[derive(Default)]
 struct WebSocketServer {
     sessions: HashMap<usize, actix::Recipient<BroadcastMessage>>,
     next_id: usize,
 }
 
-impl Default for WebSocketServer {
-    fn default() -> Self {
-        WebSocketServer {
-            sessions: HashMap::new(),
-            next_id: 0,
-        }
-    }
-}
 
 impl Actor for WebSocketServer {
     type Context = actix::Context<Self>;
@@ -195,7 +187,7 @@ impl Handler<BroadcastMessage> for WebSocketServer {
 
     fn handle(&mut self, msg: BroadcastMessage, _: &mut Self::Context) {
         // Send to all connected WebSocket sessions
-        for (_, addr) in &self.sessions {
+        for addr in self.sessions.values() {
             addr.do_send(BroadcastMessage(msg.0.clone()));
         }
     }
